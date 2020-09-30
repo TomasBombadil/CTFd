@@ -1,7 +1,7 @@
-from CTFd.utils import get_config
-
 import datetime
 import time
+
+from CTFd.utils import get_config
 
 
 def ctftime():
@@ -40,7 +40,7 @@ def ctftime():
 
 
 def ctf_paused():
-    return get_config("paused")
+    return bool(get_config("paused"))
 
 
 def ctf_started():

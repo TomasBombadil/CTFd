@@ -1,9 +1,11 @@
+import os
+from io import BytesIO
+
 import boto3
 from moto import mock_s3
-from tests.helpers import create_ctfd, destroy_ctfd
+
 from CTFd.utils.uploads import S3Uploader, rmdir
-from six import BytesIO
-import os
+from tests.helpers import create_ctfd, destroy_ctfd
 
 
 @mock_s3

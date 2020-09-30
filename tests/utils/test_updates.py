@@ -1,8 +1,10 @@
-from tests.helpers import create_ctfd, destroy_ctfd, login_as_user
+from unittest.mock import Mock, patch
+
+import requests
+
 from CTFd.utils import get_config, set_config
 from CTFd.utils.updates import update_check
-from mock import patch, Mock
-import requests
+from tests.helpers import create_ctfd, destroy_ctfd, login_as_user
 
 
 def test_update_check_is_called():
@@ -12,7 +14,7 @@ def test_update_check_is_called():
         assert get_config("version_latest") is None
 
 
-@patch.object(requests, "post")
+@patch.object(requests, "get")
 def test_update_check_identifies_update(fake_get_request):
     """Update checks properly identify new versions"""
     app = create_ctfd()
@@ -58,14 +60,14 @@ def test_update_check_notifies_user():
     destroy_ctfd(app)
 
 
-@patch.object(requests, "get")
-def test_update_check_ignores_downgrades(fake_get_request):
+@patch.object(requests, "post")
+def test_update_check_ignores_downgrades(fake_post_request):
     """Update checks do nothing on old or same versions"""
     app = create_ctfd()
     with app.app_context():
         app.config["UPDATE_CHECK"] = True
         fake_response = Mock()
-        fake_get_request.return_value = fake_response
+        fake_post_request.return_value = fake_response
         fake_response.json = lambda: {
             u"resource": {
                 u"html_url": u"https://github.com/CTFd/CTFd/releases/tag/0.0.1",
@@ -81,7 +83,7 @@ def test_update_check_ignores_downgrades(fake_get_request):
         assert get_config("version_latest") is None
 
         fake_response = Mock()
-        fake_get_request.return_value = fake_response
+        fake_post_request.return_value = fake_response
         fake_response.json = lambda: {
             u"resource": {
                 u"html_url": u"https://github.com/CTFd/CTFd/releases/tag/{}".format(

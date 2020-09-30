@@ -1,12 +1,12 @@
-from flask_sqlalchemy import SQLAlchemy
-from flask_marshmallow import Marshmallow
-from sqlalchemy.orm import validates, column_property
-from sqlalchemy.ext.hybrid import hybrid_property
-from CTFd.utils.crypto import hash_password
-from CTFd.utils.humanize.numbers import ordinalize
-from CTFd.cache import cache
 import datetime
-import six
+from collections import defaultdict
+
+from flask_marshmallow import Marshmallow
+from flask_sqlalchemy import SQLAlchemy
+from sqlalchemy.ext.hybrid import hybrid_property
+from sqlalchemy.orm import column_property, validates
+
+from CTFd.cache import cache
 
 db = SQLAlchemy()
 ma = Marshmallow()
@@ -77,8 +77,31 @@ class Challenges(db.Model):
     tags = db.relationship("Tags", backref="challenge")
     hints = db.relationship("Hints", backref="challenge")
     flags = db.relationship("Flags", backref="challenge")
+    comments = db.relationship("ChallengeComments", backref="challenge")
 
-    __mapper_args__ = {"polymorphic_identity": "standard", "polymorphic_on": type}
+    class alt_defaultdict(defaultdict):
+        """
+        This slightly modified defaultdict is intended to allow SQLAlchemy to
+        not fail when querying Challenges that contain a missing challenge type.
+
+        e.g. Challenges.query.all() should not fail if `type` is `a_missing_type`
+        """
+
+        def __missing__(self, key):
+            return self["standard"]
+
+    __mapper_args__ = {
+        "polymorphic_identity": "standard",
+        "polymorphic_on": type,
+        "_polymorphic_map": alt_defaultdict(),
+    }
+
+    @property
+    def html(self):
+        from CTFd.utils.config.pages import build_html
+        from CTFd.utils.helpers import markup
+
+        return markup(build_html(self.description))
 
     def __init__(self, *args, **kwargs):
         super(Challenges, self).__init__(**kwargs)
@@ -112,6 +135,13 @@ class Hints(db.Model):
     def description(self):
         return "Hint for {name}".format(name=self.challenge.name)
 
+    @property
+    def html(self):
+        from CTFd.utils.config.pages import build_html
+        from CTFd.utils.helpers import markup
+
+        return markup(build_html(self.content))
+
     def __init__(self, *args, **kwargs):
         super(Hints, self).__init__(**kwargs)
 
@@ -140,6 +170,8 @@ class Awards(db.Model):
 
     @hybrid_property
     def account_id(self):
+        from CTFd.utils import get_config
+
         user_mode = get_config("user_mode")
         if user_mode == "teams":
             return self.team_id
@@ -244,6 +276,10 @@ class Users(db.Model):
     # Relationship for Teams
     team_id = db.Column(db.Integer, db.ForeignKey("teams.id"))
 
+    field_entries = db.relationship(
+        "UserFieldEntries", foreign_keys="UserFieldEntries.user_id", lazy="joined"
+    )
+
     created = db.Column(db.DateTime, default=datetime.datetime.utcnow)
 
     __mapper_args__ = {"polymorphic_identity": "user", "polymorphic_on": type}
@@ -253,15 +289,33 @@ class Users(db.Model):
 
     @validates("password")
     def validate_password(self, key, plaintext):
+        from CTFd.utils.crypto import hash_password
+
         return hash_password(str(plaintext))
 
     @hybrid_property
     def account_id(self):
+        from CTFd.utils import get_config
+
         user_mode = get_config("user_mode")
         if user_mode == "teams":
             return self.team_id
         elif user_mode == "users":
             return self.id
+
+    @hybrid_property
+    def account(self):
+        from CTFd.utils import get_config
+
+        user_mode = get_config("user_mode")
+        if user_mode == "teams":
+            return self.team
+        elif user_mode == "users":
+            return self
+
+    @property
+    def fields(self):
+        return self.get_fields(admin=False)
 
     @property
     def solves(self):
@@ -281,9 +335,24 @@ class Users(db.Model):
 
     @property
     def place(self):
-        return self.get_place(admin=False)
+        from CTFd.utils.config.visibility import scores_visible
+
+        if scores_visible():
+            return self.get_place(admin=False)
+        else:
+            return None
+
+    def get_fields(self, admin=False):
+        if admin:
+            return self.field_entries
+
+        return [
+            entry for entry in self.field_entries if entry.field.public and entry.value
+        ]
 
     def get_solves(self, admin=False):
+        from CTFd.utils import get_config
+
         solves = Solves.query.filter_by(user_id=self.id)
         freeze = get_config("freeze")
         if freeze and admin is False:
@@ -292,6 +361,8 @@ class Users(db.Model):
         return solves.all()
 
     def get_fails(self, admin=False):
+        from CTFd.utils import get_config
+
         fails = Fails.query.filter_by(user_id=self.id)
         freeze = get_config("freeze")
         if freeze and admin is False:
@@ -300,6 +371,8 @@ class Users(db.Model):
         return fails.all()
 
     def get_awards(self, admin=False):
+        from CTFd.utils import get_config
+
         awards = Awards.query.filter_by(user_id=self.id)
         freeze = get_config("freeze")
         if freeze and admin is False:
@@ -307,6 +380,7 @@ class Users(db.Model):
             awards = awards.filter(Awards.date < dt)
         return awards.all()
 
+    @cache.memoize()
     def get_score(self, admin=False):
         score = db.func.sum(Challenges.value).label("score")
         user = (
@@ -339,6 +413,7 @@ class Users(db.Model):
         else:
             return 0
 
+    @cache.memoize()
     def get_place(self, admin=False, numeric=False):
         """
         This method is generally a clone of CTFd.scoreboard.get_standings.
@@ -347,15 +422,17 @@ class Users(db.Model):
         application itself will result in a circular import.
         """
         from CTFd.utils.scores import get_user_standings
+        from CTFd.utils.humanize.numbers import ordinalize
 
         standings = get_user_standings(admin=admin)
 
-        try:
-            n = standings.index((self.id,)) + 1
-            if numeric:
-                return n
-            return ordinalize(n)
-        except ValueError:
+        for i, user in enumerate(standings):
+            if user.user_id == self.id:
+                n = i + 1
+                if numeric:
+                    return n
+                return ordinalize(n)
+        else:
             return None
 
 
@@ -376,7 +453,9 @@ class Teams(db.Model):
     password = db.Column(db.String(128))
     secret = db.Column(db.String(128))
 
-    members = db.relationship("Users", backref="team", foreign_keys="Users.team_id")
+    members = db.relationship(
+        "Users", backref="team", foreign_keys="Users.team_id", lazy="joined"
+    )
 
     # Supplementary attributes
     website = db.Column(db.String(128))
@@ -390,6 +469,10 @@ class Teams(db.Model):
     captain_id = db.Column(db.Integer, db.ForeignKey("users.id", ondelete="SET NULL"))
     captain = db.relationship("Users", foreign_keys=[captain_id])
 
+    field_entries = db.relationship(
+        "TeamFieldEntries", foreign_keys="TeamFieldEntries.team_id", lazy="joined"
+    )
+
     created = db.Column(db.DateTime, default=datetime.datetime.utcnow)
 
     def __init__(self, **kwargs):
@@ -397,7 +480,13 @@ class Teams(db.Model):
 
     @validates("password")
     def validate_password(self, key, plaintext):
+        from CTFd.utils.crypto import hash_password
+
         return hash_password(str(plaintext))
+
+    @property
+    def fields(self):
+        return self.get_fields(admin=False)
 
     @property
     def solves(self):
@@ -417,9 +506,24 @@ class Teams(db.Model):
 
     @property
     def place(self):
-        return self.get_place(admin=False)
+        from CTFd.utils.config.visibility import scores_visible
+
+        if scores_visible():
+            return self.get_place(admin=False)
+        else:
+            return None
+
+    def get_fields(self, admin=False):
+        if admin:
+            return self.field_entries
+
+        return [
+            entry for entry in self.field_entries if entry.field.public and entry.value
+        ]
 
     def get_solves(self, admin=False):
+        from CTFd.utils import get_config
+
         member_ids = [member.id for member in self.members]
 
         solves = Solves.query.filter(Solves.user_id.in_(member_ids)).order_by(
@@ -434,6 +538,8 @@ class Teams(db.Model):
         return solves.all()
 
     def get_fails(self, admin=False):
+        from CTFd.utils import get_config
+
         member_ids = [member.id for member in self.members]
 
         fails = Fails.query.filter(Fails.user_id.in_(member_ids)).order_by(
@@ -448,6 +554,8 @@ class Teams(db.Model):
         return fails.all()
 
     def get_awards(self, admin=False):
+        from CTFd.utils import get_config
+
         member_ids = [member.id for member in self.members]
 
         awards = Awards.query.filter(Awards.user_id.in_(member_ids)).order_by(
@@ -461,12 +569,14 @@ class Teams(db.Model):
 
         return awards.all()
 
+    @cache.memoize()
     def get_score(self, admin=False):
         score = 0
         for member in self.members:
             score += member.get_score(admin=admin)
         return score
 
+    @cache.memoize()
     def get_place(self, admin=False, numeric=False):
         """
         This method is generally a clone of CTFd.scoreboard.get_standings.
@@ -475,15 +585,17 @@ class Teams(db.Model):
         application itself will result in a circular import.
         """
         from CTFd.utils.scores import get_team_standings
+        from CTFd.utils.humanize.numbers import ordinalize
 
         standings = get_team_standings(admin=admin)
 
-        try:
-            n = standings.index((self.id,)) + 1
-            if numeric:
-                return n
-            return ordinalize(n)
-        except ValueError:
+        for i, team in enumerate(standings):
+            if team.team_id == self.id:
+                n = i + 1
+                if numeric:
+                    return n
+                return ordinalize(n)
+        else:
             return None
 
 
@@ -511,6 +623,8 @@ class Submissions(db.Model):
 
     @hybrid_property
     def account_id(self):
+        from CTFd.utils import get_config
+
         user_mode = get_config("user_mode")
         if user_mode == "teams":
             return self.team_id
@@ -519,6 +633,8 @@ class Submissions(db.Model):
 
     @hybrid_property
     def account(self):
+        from CTFd.utils import get_config
+
         user_mode = get_config("user_mode")
         if user_mode == "teams":
             return self.team
@@ -534,9 +650,7 @@ class Submissions(db.Model):
         return child_classes[type]
 
     def __repr__(self):
-        return "<Submission {}, {}, {}, {}>".format(
-            self.team_id, self.challenge_id, self.ip, self.provided
-        )
+        return f"<Submission id={self.id}, challenge_id={self.challenge_id}, ip={self.ip}, provided={self.provided}>"
 
 
 class Solves(Submissions):
@@ -588,6 +702,8 @@ class Unlocks(db.Model):
 
     @hybrid_property
     def account_id(self):
+        from CTFd.utils import get_config
+
         user_mode = get_config("user_mode")
         if user_mode == "teams":
             return self.team_id
@@ -631,20 +747,125 @@ class Configs(db.Model):
         super(Configs, self).__init__(**kwargs)
 
 
-@cache.memoize()
-def get_config(key):
-    """
-    This should be a direct clone of its implementation in utils. It is used to avoid a circular import.
-    """
-    config = Configs.query.filter_by(key=key).first()
-    if config and config.value:
-        value = config.value
-        if value and value.isdigit():
-            return int(value)
-        elif value and isinstance(value, six.string_types):
-            if value.lower() == "true":
-                return True
-            elif value.lower() == "false":
-                return False
-            else:
-                return value
+class Tokens(db.Model):
+    __tablename__ = "tokens"
+    id = db.Column(db.Integer, primary_key=True)
+    type = db.Column(db.String(32))
+    user_id = db.Column(db.Integer, db.ForeignKey("users.id", ondelete="CASCADE"))
+    created = db.Column(db.DateTime, default=datetime.datetime.utcnow)
+    expiration = db.Column(
+        db.DateTime,
+        default=lambda: datetime.datetime.utcnow() + datetime.timedelta(days=30),
+    )
+    value = db.Column(db.String(128), unique=True)
+
+    user = db.relationship("Users", foreign_keys="Tokens.user_id", lazy="select")
+
+    __mapper_args__ = {"polymorphic_on": type}
+
+    def __init__(self, *args, **kwargs):
+        super(Tokens, self).__init__(**kwargs)
+
+    def __repr__(self):
+        return "<Token %r>" % self.id
+
+
+class UserTokens(Tokens):
+    __mapper_args__ = {"polymorphic_identity": "user"}
+
+
+class Comments(db.Model):
+    __tablename__ = "comments"
+    id = db.Column(db.Integer, primary_key=True)
+    type = db.Column(db.String(80), default="standard")
+    content = db.Column(db.Text)
+    date = db.Column(db.DateTime, default=datetime.datetime.utcnow)
+    author_id = db.Column(db.Integer, db.ForeignKey("users.id", ondelete="CASCADE"))
+    author = db.relationship("Users", foreign_keys="Comments.author_id", lazy="select")
+
+    @property
+    def html(self):
+        from CTFd.utils.config.pages import build_html
+        from CTFd.utils.helpers import markup
+
+        return markup(build_html(self.content, sanitize=True))
+
+    __mapper_args__ = {"polymorphic_identity": "standard", "polymorphic_on": type}
+
+
+class ChallengeComments(Comments):
+    __mapper_args__ = {"polymorphic_identity": "challenge"}
+    challenge_id = db.Column(
+        db.Integer, db.ForeignKey("challenges.id", ondelete="CASCADE")
+    )
+
+
+class UserComments(Comments):
+    __mapper_args__ = {"polymorphic_identity": "user"}
+    user_id = db.Column(db.Integer, db.ForeignKey("users.id", ondelete="CASCADE"))
+
+
+class TeamComments(Comments):
+    __mapper_args__ = {"polymorphic_identity": "team"}
+    team_id = db.Column(db.Integer, db.ForeignKey("teams.id", ondelete="CASCADE"))
+
+
+class PageComments(Comments):
+    __mapper_args__ = {"polymorphic_identity": "page"}
+    page_id = db.Column(db.Integer, db.ForeignKey("pages.id", ondelete="CASCADE"))
+
+
+class Fields(db.Model):
+    __tablename__ = "fields"
+    id = db.Column(db.Integer, primary_key=True)
+    name = db.Column(db.Text)
+    type = db.Column(db.String(80), default="standard")
+    field_type = db.Column(db.String(80))
+    description = db.Column(db.Text)
+    required = db.Column(db.Boolean, default=False)
+    public = db.Column(db.Boolean, default=False)
+    editable = db.Column(db.Boolean, default=False)
+
+    __mapper_args__ = {"polymorphic_identity": "standard", "polymorphic_on": type}
+
+
+class UserFields(Fields):
+    __mapper_args__ = {"polymorphic_identity": "user"}
+
+
+class TeamFields(Fields):
+    __mapper_args__ = {"polymorphic_identity": "team"}
+
+
+class FieldEntries(db.Model):
+    __tablename__ = "field_entries"
+    id = db.Column(db.Integer, primary_key=True)
+    type = db.Column(db.String(80), default="standard")
+    value = db.Column(db.JSON)
+    field_id = db.Column(db.Integer, db.ForeignKey("fields.id", ondelete="CASCADE"))
+
+    field = db.relationship(
+        "Fields", foreign_keys="FieldEntries.field_id", lazy="joined"
+    )
+
+    __mapper_args__ = {"polymorphic_identity": "standard", "polymorphic_on": type}
+
+    @hybrid_property
+    def name(self):
+        return self.field.name
+
+    @hybrid_property
+    def description(self):
+        return self.field.description
+
+
+class UserFieldEntries(FieldEntries):
+    __mapper_args__ = {"polymorphic_identity": "user"}
+    user_id = db.Column(db.Integer, db.ForeignKey("users.id", ondelete="CASCADE"))
+    user = db.relationship("Users", foreign_keys="UserFieldEntries.user_id")
+
+
+class TeamFieldEntries(FieldEntries):
+    __mapper_args__ = {"polymorphic_identity": "team"}
+    team_id = db.Column(db.Integer, db.ForeignKey("teams.id", ondelete="CASCADE"))
+    team = db.relationship("Teams", foreign_keys="TeamFieldEntries.team_id")

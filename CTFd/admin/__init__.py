@@ -1,54 +1,55 @@
-from flask import (
-    current_app as app,
-    render_template,
-    request,
-    redirect,
-    url_for,
-    Blueprint,
-    abort,
-    render_template_string,
-    send_file,
-)
-
-from CTFd.utils.decorators import admins_only
-from CTFd.utils.user import is_admin
-from CTFd.utils.security.auth import logout_user
-from CTFd.utils import config as ctf_config, get_config, set_config
-from CTFd.cache import cache, clear_config
-from CTFd.utils.helpers import get_errors
-from CTFd.utils.exports import (
-    export_ctf as export_ctf_util,
-    import_ctf as import_ctf_util,
-)
-from CTFd.models import (
-    db,
-    get_class_by_tablename,
-    Users,
-    Teams,
-    Configs,
-    Submissions,
-    Solves,
-    Awards,
-    Unlocks,
-    Tracking,
-)
+import csv
 import datetime
 import os
-import six
-import csv
+from io import BytesIO, StringIO
 
+from flask import Blueprint, abort
+from flask import current_app as app
+from flask import (
+    redirect,
+    render_template,
+    render_template_string,
+    request,
+    send_file,
+    url_for,
+)
 
 admin = Blueprint("admin", __name__)
 
-
+# isort:imports-firstparty
 from CTFd.admin import challenges  # noqa: F401
+from CTFd.admin import notifications  # noqa: F401
 from CTFd.admin import pages  # noqa: F401
 from CTFd.admin import scoreboard  # noqa: F401
 from CTFd.admin import statistics  # noqa: F401
+from CTFd.admin import submissions  # noqa: F401
 from CTFd.admin import teams  # noqa: F401
 from CTFd.admin import users  # noqa: F401
-from CTFd.admin import submissions  # noqa: F401
-from CTFd.admin import notifications  # noqa: F401
+from CTFd.cache import cache, clear_config, clear_pages, clear_standings
+from CTFd.models import (
+    Awards,
+    Challenges,
+    Configs,
+    Notifications,
+    Pages,
+    Solves,
+    Submissions,
+    Teams,
+    Tracking,
+    Unlocks,
+    Users,
+    db,
+    get_class_by_tablename,
+)
+from CTFd.utils import config as ctf_config
+from CTFd.utils import get_config, set_config
+from CTFd.utils.decorators import admins_only
+from CTFd.utils.exports import export_ctf as export_ctf_util
+from CTFd.utils.exports import import_ctf as import_ctf_util
+from CTFd.utils.helpers import get_errors
+from CTFd.utils.security.auth import logout_user
+from CTFd.utils.uploads import delete_file
+from CTFd.utils.user import is_admin
 
 
 @admin.route("/admin", methods=["GET"])
@@ -125,7 +126,7 @@ def export_csv():
     if model is None:
         abort(404)
 
-    temp = six.StringIO()
+    temp = StringIO()
     writer = csv.writer(temp)
 
     header = [column.name for column in model.__mapper__.columns]
@@ -141,7 +142,7 @@ def export_csv():
     temp.seek(0)
 
     # In Python 3 send_file requires bytes
-    output = six.BytesIO()
+    output = BytesIO()
     output.write(temp.getvalue().encode("utf-8"))
     output.seek(0)
     temp.close()
@@ -162,36 +163,73 @@ def config():
     # Clear the config cache so that we don't get stale values
     clear_config()
 
-    database_tables = sorted(db.metadata.tables.keys())
-
     configs = Configs.query.all()
     configs = dict([(c.key, get_config(c.key)) for c in configs])
 
     themes = ctf_config.get_themes()
     themes.remove(get_config("ctf_theme"))
 
-    return render_template(
-        "admin/config.html", database_tables=database_tables, themes=themes, **configs
-    )
+    return render_template("admin/config.html", themes=themes, **configs)
 
 
 @admin.route("/admin/reset", methods=["GET", "POST"])
 @admins_only
 def reset():
     if request.method == "POST":
-        # Truncate Users, Teams, Submissions, Solves, Notifications, Awards, Unlocks, Tracking
-        Tracking.query.delete()
-        Solves.query.delete()
-        Submissions.query.delete()
-        Awards.query.delete()
-        Unlocks.query.delete()
-        Users.query.delete()
-        Teams.query.delete()
-        set_config("setup", False)
+        require_setup = False
+        logout = False
+        next_url = url_for("admin.statistics")
+
+        data = request.form
+
+        if data.get("pages"):
+            _pages = Pages.query.all()
+            for p in _pages:
+                for f in p.files:
+                    delete_file(file_id=f.id)
+
+            Pages.query.delete()
+
+        if data.get("notifications"):
+            Notifications.query.delete()
+
+        if data.get("challenges"):
+            _challenges = Challenges.query.all()
+            for c in _challenges:
+                for f in c.files:
+                    delete_file(file_id=f.id)
+            Challenges.query.delete()
+
+        if data.get("accounts"):
+            Users.query.delete()
+            Teams.query.delete()
+            require_setup = True
+            logout = True
+
+        if data.get("submissions"):
+            Solves.query.delete()
+            Submissions.query.delete()
+            Awards.query.delete()
+            Unlocks.query.delete()
+            Tracking.query.delete()
+
+        if require_setup:
+            set_config("setup", False)
+            cache.clear()
+            logout_user()
+            next_url = url_for("views.setup")
+
         db.session.commit()
-        cache.clear()
-        logout_user()
+
+        clear_pages()
+        clear_standings()
+        clear_config()
+
+        if logout is True:
+            cache.clear()
+            logout_user()
+
         db.session.close()
-        return redirect(url_for("views.setup"))
+        return redirect(next_url)
 
     return render_template("admin/reset.html")

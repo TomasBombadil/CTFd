@@ -1,15 +1,15 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
 
+from CTFd.models import Teams, Users
+from CTFd.utils import set_config
 from tests.helpers import (
     create_ctfd,
     destroy_ctfd,
-    register_user,
     login_as_user,
     login_with_mlc,
+    register_user,
 )
-from CTFd.models import Teams, Users
-from CTFd.utils import set_config
 
 
 def test_oauth_not_configured():
@@ -71,10 +71,8 @@ def test_oauth_configured_flow():
         client = login_with_mlc(app)
         with client.session_transaction() as sess:
             assert sess["id"]
-            assert sess["name"]
-            assert sess["type"]
-            assert sess["email"]
             assert sess["nonce"]
+            assert sess["hash"]
     destroy_ctfd(app)
 
 

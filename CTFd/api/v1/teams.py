@@ -1,39 +1,143 @@
-from flask import session, request, abort
-from flask_restplus import Namespace, Resource
-from CTFd.models import db, Users, Teams
-from CTFd.schemas.teams import TeamSchema
-from CTFd.schemas.submissions import SubmissionSchema
+import copy
+from typing import List
+
+from flask import abort, request, session
+from flask_restx import Namespace, Resource
+
+from CTFd.api.v1.helpers.request import validate_args
+from CTFd.api.v1.helpers.schemas import sqlalchemy_to_pydantic
+from CTFd.api.v1.schemas import (
+    APIDetailedSuccessResponse,
+    PaginatedAPIListSuccessResponse,
+)
+from CTFd.cache import clear_standings, clear_team_session, clear_user_session
+from CTFd.constants import RawEnum
+from CTFd.models import Awards, Submissions, Teams, Unlocks, Users, db
 from CTFd.schemas.awards import AwardSchema
-from CTFd.cache import clear_standings
+from CTFd.schemas.submissions import SubmissionSchema
+from CTFd.schemas.teams import TeamSchema
+from CTFd.utils.decorators import admins_only, authed_only, require_team
 from CTFd.utils.decorators.visibility import (
     check_account_visibility,
     check_score_visibility,
 )
-from CTFd.utils.user import get_current_team, is_admin
-from CTFd.utils.decorators import authed_only, admins_only, require_team
-import copy
+from CTFd.utils.helpers.models import build_model_filters
+from CTFd.utils.user import get_current_team, get_current_user_type, is_admin
 
 teams_namespace = Namespace("teams", description="Endpoint to retrieve Teams")
+
+TeamModel = sqlalchemy_to_pydantic(Teams)
+TransientTeamModel = sqlalchemy_to_pydantic(Teams, exclude=["id"])
+
+
+class TeamDetailedSuccessResponse(APIDetailedSuccessResponse):
+    data: TeamModel
+
+
+class TeamListSuccessResponse(PaginatedAPIListSuccessResponse):
+    data: List[TeamModel]
+
+
+teams_namespace.schema_model(
+    "TeamDetailedSuccessResponse", TeamDetailedSuccessResponse.apidoc()
+)
+
+teams_namespace.schema_model(
+    "TeamListSuccessResponse", TeamListSuccessResponse.apidoc()
+)
 
 
 @teams_namespace.route("")
 class TeamList(Resource):
     @check_account_visibility
-    def get(self):
-        teams = Teams.query.filter_by(hidden=False, banned=False)
-        view = copy.deepcopy(TeamSchema.views.get(session.get("type", "user")))
+    @teams_namespace.doc(
+        description="Endpoint to get Team objects in bulk",
+        responses={
+            200: ("Success", "TeamListSuccessResponse"),
+            400: (
+                "An error occured processing the provided or stored data",
+                "APISimpleErrorResponse",
+            ),
+        },
+    )
+    @validate_args(
+        {
+            "affiliation": (str, None),
+            "country": (str, None),
+            "bracket": (str, None),
+            "q": (str, None),
+            "field": (
+                RawEnum(
+                    "TeamFields",
+                    {
+                        "name": "name",
+                        "website": "website",
+                        "country": "country",
+                        "bracket": "bracket",
+                        "affiliation": "affiliation",
+                    },
+                ),
+                None,
+            ),
+        },
+        location="query",
+    )
+    def get(self, query_args):
+        q = query_args.pop("q", None)
+        field = str(query_args.pop("field", None))
+        filters = build_model_filters(model=Teams, query=q, field=field)
+
+        if is_admin() and request.args.get("view") == "admin":
+            teams = (
+                Teams.query.filter_by(**query_args)
+                .filter(*filters)
+                .paginate(per_page=50, max_per_page=100)
+            )
+        else:
+            teams = (
+                Teams.query.filter_by(hidden=False, banned=False, **query_args)
+                .filter(*filters)
+                .paginate(per_page=50, max_per_page=100)
+            )
+
+        user_type = get_current_user_type(fallback="user")
+        view = copy.deepcopy(TeamSchema.views.get(user_type))
         view.remove("members")
-        response = TeamSchema(view=view, many=True).dump(teams)
+        response = TeamSchema(view=view, many=True).dump(teams.items)
 
         if response.errors:
             return {"success": False, "errors": response.errors}, 400
 
-        return {"success": True, "data": response.data}
+        return {
+            "meta": {
+                "pagination": {
+                    "page": teams.page,
+                    "next": teams.next_num,
+                    "prev": teams.prev_num,
+                    "pages": teams.pages,
+                    "per_page": teams.per_page,
+                    "total": teams.total,
+                }
+            },
+            "success": True,
+            "data": response.data,
+        }
 
     @admins_only
+    @teams_namespace.doc(
+        description="Endpoint to create a Team object",
+        responses={
+            200: ("Success", "TeamDetailedSuccessResponse"),
+            400: (
+                "An error occured processing the provided or stored data",
+                "APISimpleErrorResponse",
+            ),
+        },
+    )
     def post(self):
         req = request.get_json()
-        view = TeamSchema.views.get(session.get("type", "self"))
+        user_type = get_current_user_type()
+        view = TeamSchema.views.get(user_type)
         schema = TeamSchema(view=view)
         response = schema.load(req)
 
@@ -55,22 +159,45 @@ class TeamList(Resource):
 @teams_namespace.param("team_id", "Team ID")
 class TeamPublic(Resource):
     @check_account_visibility
+    @teams_namespace.doc(
+        description="Endpoint to get a specific Team object",
+        responses={
+            200: ("Success", "TeamDetailedSuccessResponse"),
+            400: (
+                "An error occured processing the provided or stored data",
+                "APISimpleErrorResponse",
+            ),
+        },
+    )
     def get(self, team_id):
         team = Teams.query.filter_by(id=team_id).first_or_404()
 
         if (team.banned or team.hidden) and is_admin() is False:
             abort(404)
 
-        view = TeamSchema.views.get(session.get("type", "user"))
+        user_type = get_current_user_type(fallback="user")
+        view = TeamSchema.views.get(user_type)
         schema = TeamSchema(view=view)
         response = schema.dump(team)
 
         if response.errors:
             return {"success": False, "errors": response.errors}, 400
 
+        response.data["place"] = team.place
+        response.data["score"] = team.score
         return {"success": True, "data": response.data}
 
     @admins_only
+    @teams_namespace.doc(
+        description="Endpoint to edit a specific Team object",
+        responses={
+            200: ("Success", "TeamDetailedSuccessResponse"),
+            400: (
+                "An error occured processing the provided or stored data",
+                "APISimpleErrorResponse",
+            ),
+        },
+    )
     def patch(self, team_id):
         team = Teams.query.filter_by(id=team_id).first_or_404()
         data = request.get_json()
@@ -84,24 +211,34 @@ class TeamPublic(Resource):
 
         response = schema.dump(response.data)
         db.session.commit()
-        db.session.close()
 
+        clear_team_session(team_id=team.id)
         clear_standings()
+
+        db.session.close()
 
         return {"success": True, "data": response.data}
 
     @admins_only
+    @teams_namespace.doc(
+        description="Endpoint to delete a specific Team object",
+        responses={200: ("Success", "APISimpleSuccessResponse")},
+    )
     def delete(self, team_id):
         team = Teams.query.filter_by(id=team_id).first_or_404()
+        team_id = team.id
 
         for member in team.members:
             member.team_id = None
+            clear_user_session(user_id=member.id)
 
         db.session.delete(team)
         db.session.commit()
-        db.session.close()
 
+        clear_team_session(team_id=team_id)
         clear_standings()
+
+        db.session.close()
 
         return {"success": True}
 
@@ -111,6 +248,16 @@ class TeamPublic(Resource):
 class TeamPrivate(Resource):
     @authed_only
     @require_team
+    @teams_namespace.doc(
+        description="Endpoint to get the current user's Team object",
+        responses={
+            200: ("Success", "TeamDetailedSuccessResponse"),
+            400: (
+                "An error occured processing the provided or stored data",
+                "APISimpleErrorResponse",
+            ),
+        },
+    )
     def get(self):
         team = get_current_team()
         response = TeamSchema(view="self").dump(team)
@@ -118,10 +265,22 @@ class TeamPrivate(Resource):
         if response.errors:
             return {"success": False, "errors": response.errors}, 400
 
+        response.data["place"] = team.place
+        response.data["score"] = team.score
         return {"success": True, "data": response.data}
 
     @authed_only
     @require_team
+    @teams_namespace.doc(
+        description="Endpoint to edit the current user's Team object",
+        responses={
+            200: ("Success", "TeamDetailedSuccessResponse"),
+            400: (
+                "An error occured processing the provided or stored data",
+                "APISimpleErrorResponse",
+            ),
+        },
+    )
     def patch(self):
         team = get_current_team()
         if team.captain_id != session["id"]:
@@ -141,7 +300,7 @@ class TeamPrivate(Resource):
             return {"success": False, "errors": response.errors}, 400
 
         db.session.commit()
-
+        clear_team_session(team_id=team.id)
         response = TeamSchema("self").dump(response.data)
         db.session.close()
 
@@ -206,6 +365,12 @@ class TeamMembers(Resource):
 
         if user.team_id == team.id:
             team.members.remove(user)
+
+            # Remove information that links the user to the team
+            Submissions.query.filter_by(user_id=user.id).delete()
+            Awards.query.filter_by(user_id=user.id).delete()
+            Unlocks.query.filter_by(user_id=user.id).delete()
+
             db.session.commit()
         else:
             return (

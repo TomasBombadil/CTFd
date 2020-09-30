@@ -1,6 +1,14 @@
+import re
+
 from CTFd.plugins import register_plugin_assets_directory
 
-import re
+
+class FlagException(Exception):
+    def __init__(self, message):
+        self.message = message
+
+    def __str__(self):
+        return self.message
 
 
 class BaseFlag(object):
@@ -49,10 +57,14 @@ class CTFdRegexFlag(BaseFlag):
         saved = chal_key_obj.content
         data = chal_key_obj.data
 
-        if data == "case_insensitive":
-            res = re.match(saved, provided, re.IGNORECASE)
-        else:
-            res = re.match(saved, provided)
+        try:
+            if data == "case_insensitive":
+                res = re.match(saved, provided, re.IGNORECASE)
+            else:
+                res = re.match(saved, provided)
+        # TODO: this needs plugin improvements. See #1425.
+        except re.error as e:
+            raise FlagException("Regex parse error occured") from e
 
         return res and res.group() == provided
 

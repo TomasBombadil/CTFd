@@ -1,51 +1,76 @@
-from flask import request, abort, url_for
-from flask_restplus import Namespace, Resource
+import datetime
+from typing import List
+
+from flask import abort, render_template, request, url_for
+from flask_restx import Namespace, Resource
+from sqlalchemy.sql import and_
+
+from CTFd.api.v1.helpers.request import validate_args
+from CTFd.api.v1.helpers.schemas import sqlalchemy_to_pydantic
+from CTFd.api.v1.schemas import APIDetailedSuccessResponse, APIListSuccessResponse
+from CTFd.cache import clear_standings
+from CTFd.constants import RawEnum
+from CTFd.models import ChallengeFiles as ChallengeFilesModel
 from CTFd.models import (
-    db,
     Challenges,
-    HintUnlocks,
-    Tags,
-    Hints,
-    Flags,
-    Solves,
     Fails,
-    ChallengeFiles as ChallengeFilesModel,
+    Flags,
+    Hints,
+    HintUnlocks,
+    Solves,
+    Submissions,
+    Tags,
+    db,
 )
-from CTFd.plugins.challenges import CHALLENGE_CLASSES
-from CTFd.utils.dates import isoformat
+from CTFd.plugins.challenges import CHALLENGE_CLASSES, get_chal_class
+from CTFd.schemas.flags import FlagSchema
+from CTFd.schemas.hints import HintSchema
+from CTFd.schemas.tags import TagSchema
+from CTFd.utils import config, get_config
+from CTFd.utils import user as current_user
+from CTFd.utils.config.visibility import (
+    accounts_visible,
+    challenges_visible,
+    scores_visible,
+)
+from CTFd.utils.dates import ctf_ended, ctf_paused, ctftime, isoformat, unix_time_to_utc
 from CTFd.utils.decorators import (
+    admins_only,
     during_ctf_time_only,
     require_verified_emails,
-    admins_only,
 )
 from CTFd.utils.decorators.visibility import (
     check_challenge_visibility,
     check_score_visibility,
 )
-from CTFd.cache import clear_standings
-from CTFd.utils.config.visibility import (
-    scores_visible,
-    accounts_visible,
-    challenges_visible,
-)
-from CTFd.utils.user import is_admin, authed
-from CTFd.utils.modes import get_model, generate_account_url
-from CTFd.schemas.tags import TagSchema
-from CTFd.schemas.hints import HintSchema
-from CTFd.schemas.flags import FlagSchema
-from CTFd.utils import config, get_config
-from CTFd.utils import user as current_user
-from CTFd.utils.user import get_current_team
-from CTFd.utils.user import get_current_user
-from CTFd.plugins.challenges import get_chal_class
-from CTFd.utils.dates import ctf_ended, ctf_paused, ctftime, unix_time_to_utc
+from CTFd.utils.helpers.models import build_model_filters
 from CTFd.utils.logging import log
+from CTFd.utils.modes import generate_account_url, get_model
 from CTFd.utils.security.signing import serialize
-from sqlalchemy.sql import and_
-import datetime
+from CTFd.utils.user import authed, get_current_team, get_current_user, is_admin
 
 challenges_namespace = Namespace(
     "challenges", description="Endpoint to retrieve Challenges"
+)
+
+ChallengeModel = sqlalchemy_to_pydantic(Challenges)
+TransientChallengeModel = sqlalchemy_to_pydantic(Challenges, exclude=["id"])
+
+
+class ChallengeDetailedSuccessResponse(APIDetailedSuccessResponse):
+    data: ChallengeModel
+
+
+class ChallengeListSuccessResponse(APIListSuccessResponse):
+    data: List[ChallengeModel]
+
+
+challenges_namespace.schema_model(
+    "ChallengeDetailedSuccessResponse", ChallengeDetailedSuccessResponse.apidoc()
+)
+
+challenges_namespace.schema_model(
+    "ChallengeListSuccessResponse", ChallengeListSuccessResponse.apidoc()
 )
 
 
@@ -54,35 +79,87 @@ class ChallengeList(Resource):
     @check_challenge_visibility
     @during_ctf_time_only
     @require_verified_emails
-    def get(self):
+    @challenges_namespace.doc(
+        description="Endpoint to get Challenge objects in bulk",
+        responses={
+            200: ("Success", "ChallengeListSuccessResponse"),
+            400: (
+                "An error occured processing the provided or stored data",
+                "APISimpleErrorResponse",
+            ),
+        },
+    )
+    @validate_args(
+        {
+            "name": (str, None),
+            "max_attempts": (int, None),
+            "value": (int, None),
+            "category": (str, None),
+            "type": (str, None),
+            "state": (str, None),
+            "q": (str, None),
+            "field": (
+                RawEnum(
+                    "ChallengeFields",
+                    {
+                        "name": "name",
+                        "description": "description",
+                        "category": "category",
+                        "type": "type",
+                        "state": "state",
+                    },
+                ),
+                None,
+            ),
+        },
+        location="query",
+    )
+    def get(self, query_args):
+        # Build filtering queries
+        q = query_args.pop("q", None)
+        field = str(query_args.pop("field", None))
+        filters = build_model_filters(model=Challenges, query=q, field=field)
+
         # This can return None (unauth) if visibility is set to public
         user = get_current_user()
 
-        challenges = (
-            Challenges.query.filter(
-                and_(Challenges.state != "hidden", Challenges.state != "locked")
-            )
-            .order_by(Challenges.value)
-            .all()
-        )
-
-        if user:
-            solve_ids = (
-                Solves.query.with_entities(Solves.challenge_id)
-                .filter_by(account_id=user.account_id)
-                .order_by(Solves.challenge_id.asc())
+        # Admins can request to see everything
+        if is_admin() and request.args.get("view") == "admin":
+            challenges = (
+                Challenges.query.filter_by(**query_args)
+                .filter(*filters)
+                .order_by(Challenges.value)
                 .all()
             )
-            solve_ids = set([value for value, in solve_ids])
-
-            # TODO: Convert this into a re-useable decorator
-            if is_admin():
-                pass
-            else:
-                if config.is_teams_mode() and get_current_team() is None:
-                    abort(403)
+            solve_ids = set([challenge.id for challenge in challenges])
         else:
-            solve_ids = set()
+            challenges = (
+                Challenges.query.filter(
+                    and_(Challenges.state != "hidden", Challenges.state != "locked")
+                )
+                .filter_by(**query_args)
+                .filter(*filters)
+                .order_by(Challenges.value)
+                .all()
+            )
+
+            if user:
+                solve_ids = (
+                    Solves.query.with_entities(Solves.challenge_id)
+                    .filter_by(account_id=user.account_id)
+                    .order_by(Solves.challenge_id.asc())
+                    .all()
+                )
+                solve_ids = set([value for value, in solve_ids])
+
+                # TODO: Convert this into a re-useable decorator
+                if is_admin():
+                    pass
+                else:
+                    if config.is_teams_mode() and get_current_team() is None:
+                        abort(403)
+            else:
+                solve_ids = set()
 
         response = []
         tag_schema = TagSchema(view="user", many=True)
@@ -110,7 +187,13 @@ class ChallengeList(Resource):
                     # Fallthrough to continue
                     continue
 
-            challenge_type = get_chal_class(challenge.type)
+            try:
+                challenge_type = get_chal_class(challenge.type)
+            except KeyError:
+                # Challenge type does not exist. Fall through to next challenge.
+                continue
+
+            # Challenge passes all checks, add it to response
             response.append(
                 {
                     "id": challenge.id,
@@ -128,6 +211,16 @@ class ChallengeList(Resource):
         return {"success": True, "data": response}
 
     @admins_only
+    @challenges_namespace.doc(
+        description="Endpoint to create a Challenge object",
+        responses={
+            200: ("Success", "ChallengeDetailedSuccessResponse"),
+            400: (
+                "An error occured processing the provided or stored data",
+                "APISimpleErrorResponse",
+            ),
+        },
+    )
     def post(self):
         data = request.form or request.get_json()
         challenge_type = data["type"]
@@ -150,16 +243,28 @@ class ChallengeTypes(Resource):
                 "name": challenge_class.name,
                 "templates": challenge_class.templates,
                 "scripts": challenge_class.scripts,
+                "create": render_template(
+                    challenge_class.templates["create"].lstrip("/")
+                ),
             }
         return {"success": True, "data": response}
 
 
 @challenges_namespace.route("/<challenge_id>")
-@challenges_namespace.param("challenge_id", "A Challenge ID")
 class Challenge(Resource):
     @check_challenge_visibility
     @during_ctf_time_only
     @require_verified_emails
+    @challenges_namespace.doc(
+        description="Endpoint to get a specific Challenge object",
+        responses={
+            200: ("Success", "ChallengeDetailedSuccessResponse"),
+            400: (
+                "An error occured processing the provided or stored data",
+                "APISimpleErrorResponse",
+            ),
+        },
+    )
     def get(self, challenge_id):
         if is_admin():
             chal = Challenges.query.filter(Challenges.id == challenge_id).first_or_404()
@@ -169,7 +274,13 @@ class Challenge(Resource):
                 and_(Challenges.state != "hidden", Challenges.state != "locked"),
             ).first_or_404()
 
-        chal_class = get_chal_class(chal.type)
+        try:
+            chal_class = get_chal_class(chal.type)
+        except KeyError:
+            abort(
+                500,
+                f"The underlying challenge type ({chal.type}) is not installed. This challenge can not be loaded.",
+            )
 
         if chal.requirements:
             requirements = chal.requirements.get("prerequisites", [])
@@ -260,13 +371,10 @@ class Challenge(Resource):
         Model = get_model()
 
         if scores_visible() is True and accounts_visible() is True:
-            solves = (
-                Solves.query.join(Model, Solves.account_id == Model.id)
-                .filter(
-                    Solves.challenge_id == chal.id,
-                    Model.banned == False,
-                    Model.hidden == False,
-                )
+            solves = Solves.query.join(Model, Solves.account_id == Model.id).filter(
+                Solves.challenge_id == chal.id,
+                Model.banned == False,
+                Model.hidden == False,
             )
 
             # Only show solves that happened before freeze time if configured
@@ -278,15 +386,46 @@ class Challenge(Resource):
             response["solves"] = solves
         else:
             response["solves"] = None
+            solves = None
 
+        if authed():
+            # Get current attempts for the user
+            attempts = Submissions.query.filter_by(
+                account_id=user.account_id, challenge_id=challenge_id
+            ).count()
+        else:
+            attempts = 0
+
+        response["attempts"] = attempts
         response["files"] = files
         response["tags"] = tags
         response["hints"] = hints
+
+        response["view"] = render_template(
+            chal_class.templates["view"].lstrip("/"),
+            solves=solves,
+            files=files,
+            tags=tags,
+            hints=[Hints(**h) for h in hints],
+            max_attempts=chal.max_attempts,
+            attempts=attempts,
+            challenge=chal,
+        )
 
         db.session.close()
         return {"success": True, "data": response}
 
     @admins_only
+    @challenges_namespace.doc(
+        description="Endpoint to edit a specific Challenge object",
+        responses={
+            200: ("Success", "ChallengeDetailedSuccessResponse"),
+            400: (
+                "An error occured processing the provided or stored data",
+                "APISimpleErrorResponse",
+            ),
+        },
+    )
     def patch(self, challenge_id):
         challenge = Challenges.query.filter_by(id=challenge_id).first_or_404()
         challenge_class = get_chal_class(challenge.type)
@@ -295,6 +434,10 @@ class Challenge(Resource):
         return {"success": True, "data": response}
 
     @admins_only
+    @challenges_namespace.doc(
+        description="Endpoint to delete a specific Challenge object",
+        responses={200: ("Success", "APISimpleSuccessResponse")},
+    )
     def delete(self, challenge_id):
         challenge = Challenges.query.filter_by(id=challenge_id).first_or_404()
         chal_class = get_chal_class(challenge.type)
@@ -391,8 +534,9 @@ class ChallengeAttempt(Resource):
                 )
             log(
                 "submissions",
-                "[{date}] {name} submitted {submission} with kpm {kpm} [TOO FAST]",
-                submission=request_data["submission"].encode("utf-8"),
+                "[{date}] {name} submitted {submission} on {challenge_id} with kpm {kpm} [TOO FAST]",
+                submission=request_data.get("submission", "").encode("utf-8"),
+                challenge_id=challenge_id,
                 kpm=kpm,
             )
             # Submitting too fast
@@ -437,8 +581,9 @@ class ChallengeAttempt(Resource):
 
                 log(
                     "submissions",
-                    "[{date}] {name} submitted {submission} with kpm {kpm} [CORRECT]",
-                    submission=request_data["submission"].encode("utf-8"),
+                    "[{date}] {name} submitted {submission} on {challenge_id} with kpm {kpm} [CORRECT]",
+                    submission=request_data.get("submission", "").encode("utf-8"),
+                    challenge_id=challenge_id,
                     kpm=kpm,
                 )
                 return {
@@ -454,8 +599,9 @@ class ChallengeAttempt(Resource):
 
                 log(
                     "submissions",
-                    "[{date}] {name} submitted {submission} with kpm {kpm} [WRONG]",
-                    submission=request_data["submission"].encode("utf-8"),
+                    "[{date}] {name} submitted {submission} on {challenge_id} with kpm {kpm} [WRONG]",
+                    submission=request_data.get("submission", "").encode("utf-8"),
+                    challenge_id=challenge_id,
                     kpm=kpm,
                 )
 
@@ -487,8 +633,9 @@ class ChallengeAttempt(Resource):
         else:
             log(
                 "submissions",
-                "[{date}] {name} submitted {submission} with kpm {kpm} [ALREADY SOLVED]",
-                submission=request_data["submission"].encode("utf-8"),
+                "[{date}] {name} submitted {submission} on {challenge_id} with kpm {kpm} [ALREADY SOLVED]",
+                submission=request_data.get("submission", "").encode("utf-8"),
+                challenge_id=challenge_id,
                 kpm=kpm,
             )
             return {
@@ -501,7 +648,6 @@ class ChallengeAttempt(Resource):
 
 
 @challenges_namespace.route("/<challenge_id>/solves")
-@challenges_namespace.param("id", "A Challenge ID")
 class ChallengeSolves(Resource):
     @check_challenge_visibility
     @check_score_visibility
@@ -549,7 +695,6 @@ class ChallengeSolves(Resource):
 
 
 @challenges_namespace.route("/<challenge_id>/files")
-@challenges_namespace.param("id", "A Challenge ID")
 class ChallengeFiles(Resource):
     @admins_only
     def get(self, challenge_id):
@@ -565,7 +710,6 @@ class ChallengeFiles(Resource):
 
 
 @challenges_namespace.route("/<challenge_id>/tags")
-@challenges_namespace.param("id", "A Challenge ID")
 class ChallengeTags(Resource):
     @admins_only
     def get(self, challenge_id):
@@ -581,7 +725,6 @@ class ChallengeTags(Resource):
 
 
 @challenges_namespace.route("/<challenge_id>/hints")
-@challenges_namespace.param("id", "A Challenge ID")
 class ChallengeHints(Resource):
     @admins_only
     def get(self, challenge_id):
@@ -596,7 +739,6 @@ class ChallengeHints(Resource):
 
 
 @challenges_namespace.route("/<challenge_id>/flags")
-@challenges_namespace.param("id", "A Challenge ID")
 class ChallengeFlags(Resource):
     @admins_only
     def get(self, challenge_id):

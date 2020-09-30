@@ -1,67 +1,145 @@
-from flask import (
-    current_app as app,
-    render_template,
-    request,
-    redirect,
-    abort,
-    url_for,
-    session,
-    Blueprint,
-    Response,
-    send_file,
-)
-from flask.helpers import safe_join
-
-from CTFd.models import db, Users, Admins, Teams, Files, Pages, Notifications
-from CTFd.utils import markdown
-from CTFd.cache import cache
-from CTFd.utils import get_config, set_config
-from CTFd.utils.user import authed, get_current_user
-from CTFd.utils import config
-from CTFd.utils.uploads import get_uploader
-from CTFd.utils.config.pages import get_page
-from CTFd.utils.config.visibility import challenges_visible
-from CTFd.utils.security.auth import login_user
-from CTFd.utils.security.csrf import generate_nonce
-from CTFd.utils import user as current_user
-from CTFd.utils.dates import ctftime, ctf_ended, view_after_ctf
-from CTFd.utils.decorators import authed_only
-from CTFd.utils.security.signing import (
-    unserialize,
-    BadTimeSignature,
-    SignatureExpired,
-    BadSignature,
-)
-from sqlalchemy.exc import IntegrityError
 import os
 
+from flask import Blueprint, abort
+from flask import current_app as app
+from flask import redirect, render_template, request, send_file, session, url_for
+from flask.helpers import safe_join
+from sqlalchemy.exc import IntegrityError
+
+from CTFd.cache import cache
+from CTFd.constants.config import (
+    AccountVisibilityTypes,
+    ChallengeVisibilityTypes,
+    ConfigTypes,
+    RegistrationVisibilityTypes,
+    ScoreVisibilityTypes,
+)
+from CTFd.models import (
+    Admins,
+    Files,
+    Notifications,
+    Pages,
+    Teams,
+    Users,
+    UserTokens,
+    db,
+)
+from CTFd.utils import config, get_config, set_config
+from CTFd.utils import user as current_user
+from CTFd.utils import validators
+from CTFd.utils.config import is_setup
+from CTFd.utils.config.pages import build_html, get_page
+from CTFd.utils.config.visibility import challenges_visible
+from CTFd.utils.dates import ctf_ended, ctftime, view_after_ctf
+from CTFd.utils.decorators import authed_only
+from CTFd.utils.email import (
+    DEFAULT_PASSWORD_RESET_BODY,
+    DEFAULT_PASSWORD_RESET_SUBJECT,
+    DEFAULT_SUCCESSFUL_REGISTRATION_EMAIL_BODY,
+    DEFAULT_SUCCESSFUL_REGISTRATION_EMAIL_SUBJECT,
+    DEFAULT_USER_CREATION_EMAIL_BODY,
+    DEFAULT_USER_CREATION_EMAIL_SUBJECT,
+    DEFAULT_VERIFICATION_EMAIL_BODY,
+    DEFAULT_VERIFICATION_EMAIL_SUBJECT,
+)
+from CTFd.utils.helpers import get_errors, get_infos, markup
+from CTFd.utils.modes import USERS_MODE
+from CTFd.utils.security.auth import login_user
+from CTFd.utils.security.csrf import generate_nonce
+from CTFd.utils.security.signing import (
+    BadSignature,
+    BadTimeSignature,
+    SignatureExpired,
+    serialize,
+    unserialize,
+)
+from CTFd.utils.uploads import get_uploader
+from CTFd.utils.user import authed, get_current_user, is_admin
 
 views = Blueprint("views", __name__)
 
 
 @views.route("/setup", methods=["GET", "POST"])
 def setup():
+    errors = get_errors()
     if not config.is_setup():
         if not session.get("nonce"):
             session["nonce"] = generate_nonce()
         if request.method == "POST":
-            ctf_name = request.form["ctf_name"]
+            # General
+            ctf_name = request.form.get("ctf_name")
+            ctf_description = request.form.get("ctf_description")
+            user_mode = request.form.get("user_mode", USERS_MODE)
             set_config("ctf_name", ctf_name)
+            set_config("ctf_description", ctf_description)
+            set_config("user_mode", user_mode)
 
-            # CSS
-            set_config("start", "")
+            # Style
+            theme = request.form.get("ctf_theme", "core")
+            set_config("ctf_theme", theme)
+            theme_color = request.form.get("theme_color")
+            theme_header = get_config("theme_header")
+            if theme_color and bool(theme_header) is False:
+                # Uses {{ and }} to insert curly braces while using the format method
+                css = (
+                    '<style id="theme-color">\n'
+                    ":root {{--theme-color: {theme_color};}}\n"
+                    ".navbar{{background-color: var(--theme-color) !important;}}\n"
+                    ".jumbotron{{background-color: var(--theme-color) !important;}}\n"
+                    "</style>\n"
+                ).format(theme_color=theme_color)
+                set_config("theme_header", css)
 
-            # Admin user
+            # DateTime
+            start = request.form.get("start")
+            end = request.form.get("end")
+            set_config("start", start)
+            set_config("end", end)
+            set_config("freeze", None)
+
+            # Administration
             name = request.form["name"]
             email = request.form["email"]
             password = request.form["password"]
+
+            name_len = len(name) == 0
+            names = Users.query.add_columns("name", "id").filter_by(name=name).first()
+            emails = (
+                Users.query.add_columns("email", "id").filter_by(email=email).first()
+            )
+            pass_short = len(password) == 0
+            pass_long = len(password) > 128
+            valid_email = validators.validate_email(request.form["email"])
+            team_name_email_check = validators.validate_email(name)
+
+            if not valid_email:
+                errors.append("Please enter a valid email address")
+            if names:
+                errors.append("That user name is already taken")
+            if team_name_email_check is True:
+                errors.append("Your user name cannot be an email address")
+            if emails:
+                errors.append("That email has already been used")
+            if pass_short:
+                errors.append("Pick a longer password")
+            if pass_long:
+                errors.append("Pick a shorter password")
+            if name_len:
+                errors.append("Pick a longer user name")
+
+            if len(errors) > 0:
+                return render_template(
+                    "setup.html",
+                    errors=errors,
+                    name=name,
+                    email=email,
+                    password=password,
+                    state=serialize(generate_nonce()),
+                )
+
             admin = Admins(
                 name=name, email=email, password=password, type="admin", hidden=True
             )
-
-            user_mode = request.form["user_mode"]
-
-            set_config("user_mode", user_mode)
 
             # Index page
 
@@ -80,21 +158,19 @@ def setup():
             <a href="admin">Click here</a> to login and setup your CTF
         </h4>
     </div>
-</div>""".format(
-                request.script_root
-            )
+</div>"""
 
             page = Pages(title=None, route="index", content=index, draft=False)
-            # Visibility
-            set_config("challenge_visibility", "private")
-            set_config("registration_visibility", "public")
-            set_config("score_visibility", "public")
-            set_config("account_visibility", "public")
 
-            # Start time
-            set_config("start", None)
-            set_config("end", None)
-            set_config("freeze", None)
+            # Visibility
+            set_config(
+                ConfigTypes.CHALLENGE_VISIBILITY, ChallengeVisibilityTypes.PRIVATE
+            )
+            set_config(
+                ConfigTypes.REGISTRATION_VISIBILITY, RegistrationVisibilityTypes.PUBLIC
+            )
+            set_config(ConfigTypes.SCORE_VISIBILITY, ScoreVisibilityTypes.PUBLIC)
+            set_config(ConfigTypes.ACCOUNT_VISIBILITY, AccountVisibilityTypes.PUBLIC)
 
             # Verify emails
             set_config("verify_emails", None)
@@ -106,6 +182,39 @@ def setup():
             set_config("mail_username", None)
             set_config("mail_password", None)
             set_config("mail_useauth", None)
+
+            # Set up default emails
+            set_config("verification_email_subject", DEFAULT_VERIFICATION_EMAIL_SUBJECT)
+            set_config("verification_email_body", DEFAULT_VERIFICATION_EMAIL_BODY)
+
+            set_config(
+                "successful_registration_email_subject",
+                DEFAULT_SUCCESSFUL_REGISTRATION_EMAIL_SUBJECT,
+            )
+            set_config(
+                "successful_registration_email_body",
+                DEFAULT_SUCCESSFUL_REGISTRATION_EMAIL_BODY,
+            )
+
+            set_config(
+                "user_creation_email_subject", DEFAULT_USER_CREATION_EMAIL_SUBJECT
+            )
+            set_config("user_creation_email_body", DEFAULT_USER_CREATION_EMAIL_BODY)
+
+            set_config("password_reset_subject", DEFAULT_PASSWORD_RESET_SUBJECT)
+            set_config("password_reset_body", DEFAULT_PASSWORD_RESET_BODY)
+
+            set_config(
+                "password_change_alert_subject",
+                "Password Change Confirmation for {ctf_name}",
+            )
+            set_config(
+                "password_change_alert_body",
+                (
+                    "Your password for {ctf_name} has been changed.\n\n"
+                    "If you didn't request a password change you can reset your password here: {url}"
+                ),
+            )
 
             set_config("setup", True)
 
@@ -124,13 +233,40 @@ def setup():
             login_user(admin)
 
             db.session.close()
-            app.setup = False
             with app.app_context():
                 cache.clear()
 
             return redirect(url_for("views.static_html"))
-        return render_template("setup.html", nonce=session.get("nonce"))
+        return render_template("setup.html", state=serialize(generate_nonce()))
     return redirect(url_for("views.static_html"))
+
+
+@views.route("/setup/integrations", methods=["GET", "POST"])
+def integrations():
+    if is_admin() or is_setup() is False:
+        name = request.values.get("name")
+        state = request.values.get("state")
+
+        try:
+            state = unserialize(state, max_age=3600)
+        except (BadSignature, BadTimeSignature):
+            state = False
+        except Exception:
+            state = False
+
+        if state:
+            if name == "mlc":
+                mlc_client_id = request.values.get("mlc_client_id")
+                mlc_client_secret = request.values.get("mlc_client_secret")
+                set_config("oauth_client_id", mlc_client_id)
+                set_config("oauth_client_secret", mlc_client_secret)
+                return render_template("admin/integrations.html")
+            else:
+                abort(404)
+        else:
+            abort(403)
+    else:
+        abort(403)
 
 
 @views.route("/notifications", methods=["GET"])
@@ -142,14 +278,29 @@ def notifications():
 @views.route("/settings", methods=["GET"])
 @authed_only
 def settings():
+    infos = get_infos()
+
     user = get_current_user()
     name = user.name
     email = user.email
     website = user.website
     affiliation = user.affiliation
     country = user.country
+
+    tokens = UserTokens.query.filter_by(user_id=user.id).all()
+
     prevent_name_change = get_config("prevent_name_change")
-    confirm_email = get_config("verify_emails") and not user.verified
+
+    if get_config("verify_emails") and not user.verified:
+        confirm_url = markup(url_for("auth.confirm"))
+        infos.append(
+            markup(
+                "Your email address isn't confirmed!<br>"
+                "Please check your email to confirm your email address.<br><br>"
+                f'To have the confirmation email resent please <a href="{confirm_url}">click here</a>.'
+            )
+        )
+
     return render_template(
         "settings.html",
         name=name,
@@ -157,18 +308,10 @@ def settings():
         website=website,
         affiliation=affiliation,
         country=country,
+        tokens=tokens,
         prevent_name_change=prevent_name_change,
-        confirm_email=confirm_email,
+        infos=infos,
     )
-
-
-@views.route("/static/user.css")
-def custom_css():
-    """
-    Custom CSS Handler route
-    :return:
-    """
-    return Response(get_config("css"), mimetype="text/css")
 
 
 @views.route("/", defaults={"route": "index"})
@@ -186,7 +329,31 @@ def static_html(route):
         if page.auth_required and authed() is False:
             return redirect(url_for("auth.login", next=request.full_path))
 
-        return render_template("page.html", content=markdown(page.content))
+        return render_template("page.html", content=page.content)
+
+
+@views.route("/tos")
+def tos():
+    tos_url = get_config("tos_url")
+    tos_text = get_config("tos_text")
+    if tos_url:
+        return redirect(tos_url)
+    elif tos_text:
+        return render_template("page.html", content=build_html(tos_text))
+    else:
+        abort(404)
+
+
+@views.route("/privacy")
+def privacy():
+    privacy_url = get_config("privacy_url")
+    privacy_text = get_config("privacy_text")
+    if privacy_url:
+        return redirect(privacy_url)
+    elif privacy_text:
+        return render_template("page.html", content=build_html(privacy_text))
+    else:
+        abort(404)
 
 
 @views.route("/files", defaults={"path": ""})
@@ -222,7 +389,7 @@ def files(path):
 
                 # Check user is admin if challenge_visibility is admins only
                 if (
-                    get_config("challenge_visibility") == "admins"
+                    get_config(ConfigTypes.CHALLENGE_VISIBILITY) == "admins"
                     and user.type != "admin"
                 ):
                     abort(403)

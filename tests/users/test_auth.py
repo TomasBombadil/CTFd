@@ -1,13 +1,15 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
 
-from CTFd.models import db, Users
-from CTFd.utils import set_config, get_config
-from CTFd.utils.security.signing import serialize
-from CTFd.utils.crypto import verify_password
+from unittest.mock import patch
+
 from freezegun import freeze_time
-from tests.helpers import create_ctfd, destroy_ctfd, register_user, login_as_user
-from mock import patch
+
+from CTFd.models import Users, db
+from CTFd.utils import get_config, set_config
+from CTFd.utils.crypto import verify_password
+from CTFd.utils.security.signing import serialize
+from tests.helpers import create_ctfd, destroy_ctfd, login_as_user, register_user
 
 
 def test_register_user():
@@ -45,6 +47,13 @@ def test_register_duplicate_username():
             app,
             name="user1",
             email="user2@ctfd.io",
+            password="password",
+            raise_for_error=False,
+        )
+        register_user(
+            app,
+            name="admin  ",
+            email="admin2@ctfd.io",
             password="password",
             raise_for_error=False,
         )
@@ -268,7 +277,7 @@ def test_contact_for_password_reset():
             forgot_link = "http://localhost/reset_password"
             r = client.get(forgot_link)
 
-            assert "Contact a CTF organizer" in r.get_data(as_text=True)
+            assert "contact an organizer" in r.get_data(as_text=True)
     destroy_ctfd(app)
 
 
@@ -296,13 +305,13 @@ def test_user_can_confirm_email(mock_smtp):
         r = client.get("http://localhost/confirm")
         assert "Need to resend the confirmation email?" in r.get_data(as_text=True)
 
-        # smtp.sendmail was called
-        mock_smtp.return_value.sendmail.assert_called()
+        # smtp send message function was called
+        mock_smtp.return_value.send_message.assert_called()
 
         with client.session_transaction() as sess:
             data = {"nonce": sess.get("nonce")}
             r = client.post("http://localhost/confirm", data=data)
-            assert "confirmation email has been resent" in r.get_data(as_text=True)
+            assert "Confirmation email sent to" in r.get_data(as_text=True)
 
             r = client.get("/challenges")
             assert (
@@ -324,7 +333,7 @@ def test_user_can_confirm_email(mock_smtp):
 @patch("smtplib.SMTP")
 def test_user_can_reset_password(mock_smtp):
     """Test that a user is capable of resetting their password"""
-    from email.mime.text import MIMEText
+    from email.message import EmailMessage
 
     app = create_ctfd()
     with app.app_context(), freeze_time("2012-01-14 03:21:34"):
@@ -348,22 +357,33 @@ def test_user_can_reset_password(mock_smtp):
             # Issue the password reset request
             client.post("/reset_password", data=data)
 
+            ctf_name = get_config("ctf_name")
             from_addr = get_config("mailfrom_addr") or app.config.get("MAILFROM_ADDR")
+            from_addr = "{} <{}>".format(ctf_name, from_addr)
+
             to_addr = "user@user.com"
 
             # Build the email
             msg = (
-                """Did you initiate a password reset? Click the following link to reset """
-                """your password:\n\nhttp://localhost/reset_password/InVzZXIxIg.TxD0vg.-gvVg-KVy0RWkiclAE6JViv1I0M\n\n"""
+                "Did you initiate a password reset? If you didn't initiate this request you can ignore this email. "
+                "\n\nClick the following link to reset your password:\n"
+                "http://localhost/reset_password/InVzZXJAdXNlci5jb20i.TxD0vg.28dY_Gzqb1TH9nrcE_H7W8YFM-U"
             )
-            email_msg = MIMEText(msg)
-            email_msg["Subject"] = "Message from CTFd"
+            ctf_name = get_config("ctf_name")
+
+            email_msg = EmailMessage()
+            email_msg.set_content(msg)
+
+            email_msg["Subject"] = "Password Reset Request from {ctf_name}".format(
+                ctf_name=ctf_name
+            )
             email_msg["From"] = from_addr
             email_msg["To"] = to_addr
 
             # Make sure that the reset password email is sent
-            mock_smtp.return_value.sendmail.assert_called_with(
-                from_addr, [to_addr], email_msg.as_string()
+            mock_smtp.return_value.send_message.assert_called()
+            assert str(mock_smtp.return_value.send_message.call_args[0][0]) == str(
+                email_msg
             )
 
             # Get user's original password
@@ -374,9 +394,11 @@ def test_user_can_reset_password(mock_smtp):
                 data = {"nonce": sess.get("nonce"), "password": "passwordtwo"}
 
             # Do the password reset
-            client.get("/reset_password/InVzZXIxIg.TxD0vg.-gvVg-KVy0RWkiclAE6JViv1I0M")
+            client.get(
+                "/reset_password/InVzZXJAdXNlci5jb20i.TxD0vg.28dY_Gzqb1TH9nrcE_H7W8YFM-U"
+            )
             client.post(
-                "/reset_password/InVzZXIxIg.TxD0vg.-gvVg-KVy0RWkiclAE6JViv1I0M",
+                "/reset_password/InVzZXJAdXNlci5jb20i.TxD0vg.28dY_Gzqb1TH9nrcE_H7W8YFM-U",
                 data=data,
             )
 

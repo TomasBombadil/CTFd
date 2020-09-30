@@ -1,8 +1,10 @@
-from flask import current_app as app
-from CTFd.utils import get_config
-from CTFd.utils.modes import USERS_MODE, TEAMS_MODE
-import time
 import os
+import time
+
+from flask import current_app as app
+
+from CTFd.utils import get_config
+from CTFd.utils.modes import TEAMS_MODE, USERS_MODE
 
 
 def ctf_name():
@@ -32,7 +34,7 @@ def ctf_theme():
 
 
 def is_setup():
-    return get_config("setup")
+    return bool(get_config("setup")) is True
 
 
 def is_scoreboard_frozen():
@@ -51,13 +53,13 @@ def can_send_mail():
 
 
 def get_mail_provider():
-    if app.config.get("MAIL_SERVER") and app.config.get("MAIL_PORT"):
-        return "smtp"
     if get_config("mail_server") and get_config("mail_port"):
         return "smtp"
-    if app.config.get("MAILGUN_API_KEY") and app.config.get("MAILGUN_BASE_URL"):
-        return "mailgun"
     if get_config("mailgun_api_key") and get_config("mailgun_base_url"):
+        return "mailgun"
+    if app.config.get("MAIL_SERVER") and app.config.get("MAIL_PORT"):
+        return "smtp"
+    if app.config.get("MAILGUN_API_KEY") and app.config.get("MAILGUN_BASE_URL"):
         return "mailgun"
 
 
