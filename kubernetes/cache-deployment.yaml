@@ -1,0 +1,42 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  annotations:
+    kompose.cmd: kompose convert --verbose
+    kompose.version: 1.21.0 ()
+  creationTimestamp: null
+  labels:
+    io.kompose.service: cache
+  name: cache
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      io.kompose.service: cache
+  strategy:
+    type: Recreate
+  template:
+    metadata:
+      annotations:
+        kompose.cmd: kompose convert --verbose
+        kompose.version: 1.21.0 ()
+      creationTimestamp: null
+      labels:
+        io.kompose.network/ctfd_internal: "true"
+        io.kompose.service: cache
+    spec:
+      containers:
+      - image: redis:4
+        imagePullPolicy: ""
+        name: cache
+        resources: {}
+        volumeMounts:
+        - mountPath: /data
+          name: cache-claim0
+      restartPolicy: Always
+      serviceAccountName: ""
+      volumes:
+      - name: cache-claim0
+        persistentVolumeClaim:
+          claimName: cache-claim0
+status: {}

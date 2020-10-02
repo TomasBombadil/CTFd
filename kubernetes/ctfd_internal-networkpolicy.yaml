@@ -1,0 +1,14 @@
+apiVersion: extensions/v1beta1
+kind: NetworkPolicy
+metadata:
+  creationTimestamp: null
+  name: ctfd_internal
+spec:
+  ingress:
+  - from:
+    - podSelector:
+        matchLabels:
+          io.kompose.network/ctfd_internal: "true"
+  podSelector:
+    matchLabels:
+      io.kompose.network/ctfd_internal: "true"
